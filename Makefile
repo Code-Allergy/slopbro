@@ -4,7 +4,7 @@
 # Copyright 2026. Licensed under AGPL v3 or later. No warranties.
 
 INPUT_SCRIPT = slopbro.py
-WWWROOT_FILES = index.html autoroot.sh package.json main.js
+WWWROOT_FILES = index.html autoroot.sh package.json main.js luna-helper.js hbchannel-startup.sh
 PACKED_FILE = dist/slopbro_packed.py
 
 PACKAGING_TOOL = tools/package_single_file.py
@@ -19,3 +19,12 @@ dist: $(PACKAGING_TOOL) $(INPUT_SCRIPT) $(addprefix wwwroot/, $(WWWROOT_FILES))
 .PHONY: clean
 clean:
 	rm -rf -- 'dist/'
+
+.PHONY: test
+test:
+	python3 -m unittest discover -s tests -v
+	node tests/test_payload.js
+	python3 -m py_compile slopbro.py tools/package_single_file.py
+	node --check wwwroot/main.js
+	node --check wwwroot/luna-helper.js
+	bash -n wwwroot/autoroot.sh wwwroot/hbchannel-startup.sh

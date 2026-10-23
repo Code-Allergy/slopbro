@@ -1,176 +1,155 @@
-# SlopBro
+# SlopBro security hardening fork
 
-Some of the Python was written by an LLM. (You think I wanted to write a
-Python 2.7/3.x-compatible WebSocket client?) The rest is good, old-fashioned
-**human** slop. It's the spirit of the times, you know?
+This fork hardens the launcher and installer from
+[throwaway96/slopbro](https://github.com/throwaway96/slopbro) at commit
+21023d56ca424607bb03d2939609cc658c655fc7. SlopBro uses a webOS jsserver
+vulnerability to install and elevate Homebrew Channel on an owned TV.
 
-## Overview
+**Experimental: the changes have offline regression coverage, but have not been
+tested on a TV. No firmware/model combination is certified by this fork.**
+LG firmware numbers such as 33.53.22 are different from internal webOS versions;
+do not infer compatibility from that number alone.
 
-SlopBro is a proof-of-concept exploit for the jsserver vulnerability in
-LG TVs.
+## Security changes
 
-~~I tried to make it compatible with Python 2.7 and 3.x with no dependencies
-outside the standard library so that it could be run on all versions of
-webOS TV. Unfortunately, the Python 2.7 environment on webOS 6 (and
-presumably older) is missing the HTTP server stuff, so it was kind of a
-waste of time. Oh well.~~
+- All executable assets, the page, manifest, and installer receipts use trusted
+  HTTPS. There is no insecure payload mode or certificate-validation bypass.
+- The SSAP connection requires an independently verified SHA-256 pin for the
+  TV's certificate before sending any saved pairing key or pairing request.
+- Homebrew Channel v0.7.3 is downloaded on the computer over validated HTTPS
+  (or supplied locally) and its pinned SHA-256 is checked on both devices.
+- Payload URLs use a random 256-bit session capability and an exact TV IPv4
+  source restriction. Files are snapshotted before serving.
+- A reviewed Homebrew Channel startup policy is installed before elevation.
+  It never starts Telnet, including in failsafe mode. SSH is disabled initially;
+  later opt-in requires a nonempty regular authorized_keys file and uses
+  Dropbear with password authentication disabled. No shared root password is set.
+- Explicit package-install failures take priority over success text. Success
+  requires the expected package identity, a zero installer exit status, and
+  Homebrew Channel's current-root check. Download requests and HEAD requests
+  never establish installation success.
+- Downloads, connections, Luna requests, installer subprocesses and the launcher
+  wait are bounded. Failure leaves a nonzero launcher exit and diagnostic state.
 
-Python 2 support has now been dropped. SSAP never worked right via loopback
-anyway. The script still uses only the standard library.
+See [SECURITY.md](SECURITY.md) for the trust assumptions and remaining risks.
 
-I've only lightly tested it (remember: slop!), but people have gotten it
-to work on a bunch of webOS versions.
+## Requirements
 
-SlopBro has been used successfully against webOS 4–11 and now includes
-a workaround for LG's attempt to patch the jsserver vulnerability.
-(While it might work all the way back to webOS 3.4.2, I recommend using
-[dejavuln-autoroot](https://github.com/throwaway96/dejavuln-autoroot) for
-webOS 3.5 and 4.x.)
+On the computer: Python 3.12+, a trusted local checkout, and a TLS certificate
+chain/private key for a hostname that resolves to the computer from the TV.
+The chain must validate on the computer, TV browser, download service, and TV
+Node runtime. The hostname must match the certificate. Use a certificate from
+a CA already trusted by those clients, or a CA deliberately provisioned through
+a trusted administrative channel. The launcher validates its server locally
+before pairing. TLS 1.2 or newer is required.
 
-### How it works
+The TV must have a correct clock, support the existing upstream entry point,
+and have the required Bash, Node, OpenSSL, timeout, and Luna tools. Missing
+requirements stop the installation. The download service must support creating
+the per-session target directory. These TV-specific requirements need hardware
+validation. The LG Developer Mode app must be absent; unknown app state is
+rejected. Existing custom startup scripts or unsigned Developer Mode scripts
+require manual review before this installer will proceed.
 
-`slopbro.py` is the main script. It performs the following steps:
-
-1. Starts an HTTP server to serve the exploit page and payloads.
-2. Opens an SSAP connection to the TV.
-3. Launches a WAM app pointing at the exploit page `index.html`.
-
-Pages running in the context of certain WAM apps can make privileged
-Luna requests. When loaded on the TV, `index.html` does the following:
-
-1. Displays status and debug info on the TV screen.
-2. Downloads files for a fake `com.webos.service.jsserver` package from the
-   HTTP server.
-3. Runs the package using the jsserver vulnerability.
-
-The entry point of the fake `com.webos.service.jsserver` package is `main.js`,
-which is executed with root privileges. It is responsible for launching
-`autoroot.sh`, which installs Homebrew Channel and enables persistence.
+Obtain the TV certificate pin through an independently trusted channel. Merely
+copying a certificate fingerprint from an unauthenticated LAN connection does
+not establish the TV's identity. Do not disable validation if a certificate
+check fails.
 
 ## Running
 
-Run the script with Python 3, passing the IP address of your TV:
+The following is a template; substitute your independently verified values:
 
-```bash
-python slopbro.py [--debug] [--curl-insecure] [--fake-service-path <PATH>|--no-fake-service-path] [--local-ip <LOCAL IP>] [--webos-version <VERSION>] [--asset-source <auto|dir|embedded>] [--test-server <simple|payload>] [<TV IP ADDRESS>]
-```
+~~~sh
+python3 slopbro.py TV_IP \
+  --webos-version INTERNAL_WEBOS_VERSION \
+  --tv-cert-sha256 VERIFIED_64_HEX_DIGIT_FINGERPRINT \
+  --payload-host payload.example.net \
+  --tls-cert /path/to/fullchain.pem \
+  --tls-key /path/to/privkey.pem
+~~~
 
-Use `python3 slopbro.py --help` for the full option reference.
+The certificate private key stays on the computer and is never served.
+The listener binds to the selected local interface, usually port 8080; a busy
+port causes an ephemeral port to be selected. The TV needs access to that
+port and the computer needs access to SSAP TLS port 3001. Keep session URLs
+private. Pairing keys are stored in mode-0600 files in the current directory.
 
-Accept the pairing prompt on the target TV. (The credentials will be saved in
-a `.key` file for future use.)
+Use --local-ip to select the listening interface, and --hbchannel-ipk to
+provide the exact v0.7.3 package locally. The required package SHA-256 is:
 
-### Options
+~~~text
+d10bf3c753551d7c72fb7a92b20fcd2317e502a220ac668ba8e76f6ea78b363c
+~~~
 
-The `--debug` option enables extra output on the TV screen as well as in
-`autoroot.log`.
+The pin identifies one release artifact; it does not certify the entire
+Homebrew Channel implementation. A different release needs a deliberate
+dependency review and code change.
 
-The `--curl-insecure` option passes `-k` to `curl` when downloading Homebrew
-Channel, disabling TLS certificate verification. Use it only when necessary
-(e.g., when your TV does not have the correct date due to SDP being blocked).
+--operation-timeout controls the launcher's result wait (default 180 seconds,
+range 1–600). A timeout does not roll back the TV or prove the TV stopped.
+--fake-service-path and --no-fake-service-path retain the existing upstream
+entry-point options. --asset-source selects dir, embedded, or auto; auto
+prefers embedded assets. python3 slopbro.py --help lists all options.
 
-The `--fake-service-path` option specifies the fake service path used to
-bypass the service launch patch. It defaults to
-`/usr/palm/services/com.palm.service.devmode`. Use `--no-fake-service-path` to
-disable the bypass and omit the `fake-service-path` query parameter.
+The TV page shows download/startup status. The computer prints a final JSON
+result only after receiving a successful installer receipt. reboot_verified
+is always false: this fork never automatically reboots or claims reboot
+persistence was tested. On error, inspect the session's install-state.json
+and private installer-*.log files before retrying or rebooting.
 
-The `--local-ip` option allows you to specify the local IP address manually,
-which can be useful if the script guesses the wrong IP address.
+For a fixed-text connectivity check with no pairing or payload:
 
-The `--webos-version` option specifies the TV's webOS version and limits the
-target apps to those configured for that major version. Dotted versions such
-as `6.5` are accepted and treated as major version `6`.
+~~~sh
+python3 slopbro.py --test-server simple --local-ip COMPUTER_IP TV_IP
+~~~
 
-*The version is not currently auto-detected, so you may need to specify it if
-the selected app fails.*
+--test-server payload requires the HTTPS prerequisites and serves the real
+payload without pairing or launching an app. Opening it in a privileged TV
+context can still execute the installer.
 
-The `--asset-source` option allows you to specify where the script should look
-for assets (`auto`, `dir`, `embedded`).
+## Recovery and remote access
 
-The `--test-server` option starts the local HTTP server and prints its URL
-instead of connecting to the TV over SSAP, so you can test connectivity
-manually by opening the URL in a browser. It doesn't pair with or launch
-anything on the TV. The `<TV IP ADDRESS>` argument is optional but
-recommended in both modes below; if omitted, the script guesses a
-LAN-facing local IP, which may be wrong. Two modes are available:
+The hardened startup is /var/lib/webosbrew/startup.sh. Do not overwrite it with
+the stock Homebrew Channel startup script: doing so can restore stock Telnet
+behavior. Review Homebrew Channel upgrades and any replacement startup hooks.
 
-- `simple`: serves a fixed plain-text response to confirm basic HTTP
-  reachability only.
-- `payload`: serves the real exploit/payload files (same as a normal run)
-  without doing any SSAP pairing or launching, so you can load `index.html`
-  directly in a browser to examine the payload itself.
+SSH stays disabled on installation. If you later enable the Homebrew Channel
+SSH flag, first provision your own authorized_keys at
+/home/root/.ssh/authorized_keys through a trusted channel. Startup checks for
+a regular nonempty file, secures its permissions, and passes -s to Dropbear
+to disable password login. The same policy applies in failsafe mode.
+Telnet is unsupported even if its Homebrew Channel UI setting is changed.
 
-## Packaging
+This installer does not terminate preexisting SSH/Telnet listeners or audit
+user-created boot hooks. It does not undo an existing root compromise.
+After package installation begins, a failure may leave partial app/service
+changes. Secure startup defaults are retained; automatic unroot/rollback is
+not provided. Before installation begins, a changed developer-mode marker
+is restored on ordinary failure where possible. Forced power loss or SIGKILL
+can bypass cleanup and leave a stale installer lock.
 
-In addition to serving files from the `wwwroot` directory, SlopBro can be
-distributed as a single file with embedded assets.
+## Building and testing
 
-### Building a single-file package
+~~~sh
+make test dist
+~~~
 
-The packaging tool requires Python 3.12 or newer (independently of the
-launcher's runtime requirements). Generate a standalone file with:
+Tests are offline: loopback TLS fixtures, inert Luna/elevation stubs, temporary
+filesystem mappings for TV scripts, and browser/Node harnesses. No test contacts
+a TV or runs the real installer against the host filesystem. CI uses a pinned
+checkout action with read-only repository permissions and no persisted token.
 
-```bash
-python3 tools/package_single_file.py --out dist/slopbro_packed.py
-```
+The packed file is dist/slopbro_packed.py. It embeds all six static payload
+assets, including the hardened startup and Luna helper. It still requires the
+same certificate/pin options and separately validates the Homebrew Channel
+package. Do not replace a reviewed source checkout with an unverified packed
+download.
 
-Then run it directly (no `wwwroot` required):
+## Credits and license
 
-```bash
-python3 dist/slopbro_packed.py 192.168.1.50
-```
-
-You can also explicitly specify where it should look for assets
-(`embedded`, `dir`):
-
-```bash
-python3 dist/slopbro_packed.py --asset-source embedded 192.168.1.50
-```
-
-By default (`auto` mode), embedded assets are preferred over files if both
-are present.
-
-## Tests
-
-Run the CLI and HTTP handler regression tests without connecting to a TV:
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-## Troubleshooting
-
-- `slopbro.py` guesses what the local IP address is and might get it wrong.
-  If you don't see any connections back to the HTTP server, try manually
-  specifying the IP address with `--local-ip`.
-
-- Make sure there are no weird network issues between your TV and wherever
-  you're running SlopBro. Remember that connections need to work in both
-  directions.
-
-- Use `--test-server simple` to check basic HTTP connectivity from the TV's
-  browser without needing SSAP pairing to work first.
-
-## Credits
-
-IDK, Claude Sonnet 4.6?
-
-(`dangbei-overlay` from [dangbro](https://github.com/azoffshowy/dangbro);
-jsserver vulnerability first publicly disclosed in
-[jsbro-autoroot](https://github.com/raws0kil/jsbro-autoroot).)
-
-## License
-
-This program is free software: you can redistribute it and/or modify it under
-the terms of the GNU Affero General Public License as published by the Free
-Software Foundation, either version 3 of the License, or (at your option) any
-later version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
-
-You should have received a copy of the GNU Affero General Public License along
-with this program. If not, see <https://www.gnu.org/licenses/>.
-
-See `COPYING` for details.
+Original SlopBro: throwaway96. The original project credits dangbro for the
+dangbei-overlay entry and jsbro-autoroot for the public jsserver disclosure.
+The launcher/installer changes remain AGPL-3.0-or-later; see COPYING.
+The derived webOS Brew startup is MIT licensed, with the full notice embedded
+in the script and reproduced in THIRD_PARTY_LICENSES.txt. No warranty.

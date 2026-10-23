@@ -10,30 +10,28 @@
 slopbro.py - Connect to an LG webOS TV over SSAP, pair, and
 launch various apps with a self-hosted payload page.
 
-Single file, standard library only. Requires Python 3 and should be run on
-a PC on the same LAN as the TV.
-
-Example:
-    python3 slopbro.py 192.168.1.50
-    python3 slopbro.py --debug 192.168.1.50
-    python3 slopbro.py --local-ip 1.2.3.4 192.168.1.50
+Standard library only. Requires trusted HTTPS payload delivery and a TV
+certificate pin. See README.md and --help for prerequisites and usage.
 """
 
 import argparse
 import base64
-import io
 import json
+import hmac
 import os
-import posixpath
+import re
+import secrets
 import socket
 import ssl
 import struct
 import sys
 import threading
 import time
-from hashlib import sha1
-from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHandler
-from urllib.parse import unquote, urlsplit
+import tempfile
+from hashlib import sha1, sha256
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit, urlencode
+from urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_opener
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -63,7 +61,15 @@ SHELL_SCRIPT = "autoroot.sh"
 SERVICE_FILES = [
     "package.json",
     "main.js",
+    "luna-helper.js",
+    "hbchannel-startup.sh",
 ]
+HBC_NAME = "hbchannel.ipk"
+HBC_SHA256 = "d10bf3c753551d7c72fb7a92b20fcd2317e502a220ac668ba8e76f6ea78b363c"
+HBC_URL = "https://github.com/webosbrew/webos-homebrew-channel/releases/download/v0.7.3/org.webosbrew.hbchannel_0.7.3_all.ipk"
+MAX_PACKAGE_BYTES = 8 * 1024 * 1024
+MAX_WS_BYTES = 8 * 1024 * 1024
+MAX_HEADER_BYTES = 64 * 1024
 
 ASSET_SOURCE_AUTO = "auto"
 ASSET_SOURCE_DIR = "dir"
@@ -139,22 +145,35 @@ class WebSocket:
     def __init__(self, sock):
         self._sock = sock
         self._recv_buf = b""
+        self._recv_deadline = None
         self.closed = False
 
     @classmethod
-    def connect(cls, host, port, secure=True, timeout=CONNECT_TIMEOUT):
+    def connect(cls, host, port, secure=True, timeout=CONNECT_TIMEOUT, fingerprint=None):
+        if not secure or not fingerprint:
+            raise WebSocketError("a verified TV certificate SHA-256 fingerprint is required")
         raw = socket.create_connection((host, port), timeout)
-        if secure:
+        sock = None
+        try:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            # Intentional: the TV uses a self-signed certificate.
+            # A TV normally has a self-signed certificate. Authenticate its
+            # exact DER bytes before sending a saved key or pairing request.
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
             sock = context.wrap_socket(raw, server_hostname=host)
-        else:
-            sock = raw
-        ws = cls(sock)
-        ws._handshake(host, port, secure)
-        return ws
+            actual = sha256(sock.getpeercert(binary_form=True)).hexdigest()
+            if not hmac.compare_digest(actual, fingerprint):
+                sock.close()
+                raise WebSocketError("TV certificate fingerprint mismatch; no credentials sent")
+            ws = cls(sock)
+            ws._recv_deadline = time.monotonic() + timeout
+            ws._handshake(host, port, secure)
+            ws._recv_deadline = None
+            return ws
+        except BaseException:
+            (sock if sock is not None else raw).close()
+            raise
 
     def _handshake(self, host, port, secure):
         key = base64.b64encode(os.urandom(16)).decode("ascii")
@@ -193,21 +212,31 @@ class WebSocket:
 
     def _read_http_headers(self):
         while b"\r\n\r\n" not in self._recv_buf:
-            chunk = self._sock.recv(4096)
+            chunk = self._receive(4096)
             if not chunk:
                 raise WebSocketError("connection closed during handshake")
             self._recv_buf += chunk
+            if len(self._recv_buf) > MAX_HEADER_BYTES:
+                raise WebSocketError("WebSocket handshake headers exceed the size limit")
         header_bytes, self._recv_buf = self._recv_buf.split(b"\r\n\r\n", 1)
         return header_bytes.decode("latin-1")
 
     def _recv_exact(self, n):
         while len(self._recv_buf) < n:
-            chunk = self._sock.recv(max(4096, n - len(self._recv_buf)))
+            chunk = self._receive(max(4096, n - len(self._recv_buf)))
             if not chunk:
                 raise WebSocketError("connection closed")
             self._recv_buf += chunk
         data, self._recv_buf = self._recv_buf[:n], self._recv_buf[n:]
         return data
+
+    def _receive(self, size):
+        if self._recv_deadline is not None:
+            remaining = self._recv_deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout("WebSocket receive deadline exceeded")
+            self._sock.settimeout(remaining)
+        return self._sock.recv(size)
 
     def send_text(self, text):
         self._send_frame(self.OP_TEXT, text.encode("utf-8"))
@@ -240,12 +269,27 @@ class WebSocket:
         Transparently answers pings. Returns
         None if the peer sends a close frame.
         """
-        if timeout is not None:
-            self._sock.settimeout(timeout)
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        self._recv_deadline = deadline
+        fragments = []
+        size = 0
         while True:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("WebSocket message deadline exceeded")
+                self._sock.settimeout(remaining)
             fin, opcode, payload = self._read_frame()
             if opcode == self.OP_TEXT:
-                return payload.decode("utf-8")
+                if fragments:
+                    raise WebSocketError("unexpected text frame during fragmented message")
+                fragments.append(payload)
+                size += len(payload)
+            elif opcode == 0x0:
+                if not fragments:
+                    raise WebSocketError("unexpected continuation frame")
+                fragments.append(payload)
+                size += len(payload)
             elif opcode == self.OP_PING:
                 self._send_frame(self.OP_PONG, payload)
                 continue
@@ -255,12 +299,20 @@ class WebSocket:
                 self._send_close()
                 self.closed = True
                 return None
-            # Ignore unexpected non-text frames.
-            if not fin:
-                continue
+            else:
+                raise WebSocketError("unsupported WebSocket opcode")
+            if size > MAX_WS_BYTES:
+                raise WebSocketError("WebSocket message exceeds the size limit")
+            if fin:
+                try:
+                    return b"".join(fragments).decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise WebSocketError("invalid UTF-8 WebSocket message") from exc
 
     def _read_frame(self):
         b0, b1 = struct.unpack("!BB", self._recv_exact(2))
+        if b0 & 0x70 or b1 & 0x80:
+            raise WebSocketError("unexpected WebSocket extensions or masked server frame")
         fin = bool(b0 & 0x80)
         opcode = b0 & 0x0F
         masked = bool(b1 & 0x80)
@@ -269,6 +321,8 @@ class WebSocket:
             length = struct.unpack("!H", self._recv_exact(2))[0]
         elif length == 127:
             length = struct.unpack("!Q", self._recv_exact(8))[0]
+        if length > MAX_WS_BYTES or (opcode >= 8 and (not fin or length > 125)):
+            raise WebSocketError("invalid or oversized WebSocket frame")
         mask = self._recv_exact(4) if masked else None
         payload = self._recv_exact(length) if length else b""
         if mask:
@@ -333,9 +387,9 @@ class SSAPClient:
         self._send({"id": msg_id, "type": "register", "payload": payload})
 
         prompted = False
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         while True:
-            remaining = deadline - time.time()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SSAPError("timed out waiting for registration")
             try:
@@ -368,9 +422,9 @@ class SSAPClient:
                 "payload": payload or {},
             }
         )
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         while True:
-            remaining = deadline - time.time()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SSAPError("timed out waiting for response to %s" % uri)
             try:
@@ -408,21 +462,21 @@ def load_client_key(ip):
 
 def save_client_key(ip, client_key):
     path = key_path(ip)
-    directory = os.path.dirname(path)
-    if directory:
-        try:
-            os.makedirs(directory, exist_ok=True)
-        except OSError:
-            pass
+    directory = os.path.dirname(path) or "."
+    temporary = None
     try:
-        with open(path, "w") as fh:
+        os.makedirs(directory, exist_ok=True)
+        # Create with mode 0600 before any secret is written, then replace the
+        # directory entry atomically rather than following a preexisting link.
+        fd, temporary = tempfile.mkstemp(prefix=".slopbro-key-", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(client_key)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+        os.replace(temporary, path)
     except OSError as exc:
         log("warning: could not save client key to %s (%s)" % (path, exc))
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +539,7 @@ def launch_app(client, app_id, params):
     resp = client.request(
         "ssap://system.launcher/launch", {"id": app_id, "params": params}
     )
-    if resp.get("type") == "error":
+    if resp.get("type") == "error" or (resp.get("payload") or {}).get("returnValue") is not True:
         raise SSAPError("launch failed: %s" % resp.get("error", "unknown"))
     return resp.get("payload") or {}
 
@@ -679,151 +733,297 @@ def resolve_asset_root(asset_source, tracked_files):
 
 
 class RequestedFilesTracker:
+    """Transfer diagnostics only; never interpreted as installation success."""
     def __init__(self, tracked_files):
         self._tracked = set(tracked_files)
         self._seen = set()
         self._lock = threading.Lock()
-        self._complete = threading.Event()
-        if not self._tracked:
-            self._complete.set()
 
-    def mark_seen(self, rel_path):
+    def mark_seen(self, name):
         with self._lock:
-            if rel_path not in self._tracked or rel_path in self._seen:
-                return False, len(self._seen), len(self._tracked)
-            self._seen.add(rel_path)
-            if self._seen == self._tracked:
-                self._complete.set()
-            return True, len(self._seen), len(self._tracked)
-
-    def wait_for_all(self, timeout):
-        return self._complete.wait(timeout)
+            self._seen.add(name)
 
     def missing_files(self):
         with self._lock:
             return sorted(self._tracked - self._seen)
 
-    def total_files(self):
+
+class SecureSession:
+    def __init__(self, assets, peer_ip, debug=False):
+        self.assets = dict(assets)
+        self.peer_ip = peer_ip
+        self.debug = debug
+        self.token = secrets.token_hex(32)
+        self.tracker = RequestedFilesTracker(self.assets)
+        self.result = None
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+
+    def manifest(self):
+        return json.dumps({
+            "session": self.token,
+            "files": sorted(name for name in self.assets if name != ENTRY_PAGE),
+            "sha256": {name: sha256(data).hexdigest() for name, data in self.assets.items()},
+            "package_sha256": HBC_SHA256,
+        }, sort_keys=True).encode("utf-8")
+
+    def receive_result(self, payload):
+        if not isinstance(payload, dict) or set(payload) - {"ok", "root_verified", "phase", "error"}:
+            raise ValueError("invalid result object")
+        if type(payload.get("ok")) is not bool or type(payload.get("root_verified")) is not bool:
+            raise ValueError("result must contain boolean status fields")
+        if not isinstance(payload.get("phase"), str) or len(payload["phase"]) > 64:
+            raise ValueError("invalid result phase")
+        if "error" in payload and (not isinstance(payload["error"], str) or len(payload["error"]) > 500):
+            raise ValueError("invalid result error")
+        if payload["ok"] and (not payload["root_verified"] or self.tracker.missing_files()):
+            raise ValueError("success requires completed transfers and a root check")
         with self._lock:
-            return len(self._tracked)
+            if self.result is not None:
+                raise ValueError("a terminal result was already received")
+            self.result = payload
+            self._event.set()
+
+    def wait(self, timeout):
+        if not self._event.wait(timeout):
+            raise RuntimeError("no terminal installer result received before the deadline; inspect the TV before retrying or rebooting")
+        if not self.result["ok"]:
+            raise RuntimeError("TV installer failed in phase %s: %s" % (
+                self.result["phase"], self.result.get("error", "unspecified failure")))
+        return dict(self.result, reboot_verified=False)
 
 
-def make_tracking_handler(
-    root_dir,
-    tracker,
-    tracked_files,
-    allow_embedded_assets,
-    allow_filesystem_fallback,
-):
-    tracked = set(tracked_files)
+def make_tracking_handler(session):
+    class Handler(BaseHTTPRequestHandler):
+        def setup(self):
+            # Bound the entire connection as well as individual socket reads.
+            # A trickled TLS handshake or HTTP header must not hold a worker.
+            self._deadline_timer = threading.Timer(15.0, self._expire)
+            self._deadline_timer.daemon = True
+            self._deadline_timer.start()
+            try:
+                self.request = self.server.tls_context.wrap_socket(self.request, server_side=True)
+                super().setup()
+            except BaseException:
+                self._deadline_timer.cancel()
+                raise
 
-    class TrackingHTTPRequestHandler(SimpleHTTPRequestHandler):
-        def _requested_rel_path(self):
-            raw_path = urlsplit(self.path).path
-            raw_path = unquote(raw_path, errors="surrogatepass")
-            raw_path = posixpath.normpath(raw_path)
-            if raw_path in ("", "/", "."):
-                return ENTRY_PAGE
-            rel_path = raw_path.lstrip("/")
-            if rel_path.startswith("../") or rel_path == "..":
+        def _expire(self):
+            try:
+                self.request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        def finish(self):
+            try:
+                super().finish()
+            finally:
+                self._deadline_timer.cancel()
+                # wrap_socket detaches the original socket held by socketserver.
+                # Close the SSL socket itself rather than the detached original.
+                self.request.close()
+
+        def log_message(self, *_):
+            # Request URLs contain a per-run capability. Never log them.
+            pass
+
+        def _asset_name(self):
+            if self.client_address[0] != session.peer_ip:
                 return None
-            return rel_path.replace("\\", "/")
+            path = urlsplit(self.path).path
+            parts = path.split("/")
+            if len(parts) != 3 or not re.fullmatch(r"[0-9a-f]{64}", parts[1]):
+                return None
+            if not hmac.compare_digest(parts[1], session.token):
+                return None
+            return parts[2]
 
-        def _send_bytes(self, rel_path, data):
-            ctype = self.guess_type(rel_path)
-            self.send_response(200)
-            self.send_header("Content-type", ctype)
-            self.send_header("Content-Length", str(len(data)))
+        def _headers(self, code, length=0, ctype="application/octet-stream"):
+            self.send_response(code)
+            self.send_header("Content-Length", str(length))
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
             self.end_headers()
-            return io.BytesIO(data)
 
-        def _mark_served_file(self, rel_path):
-            marked, seen_count, total_count = tracker.mark_seen(rel_path)
-            if marked:
-                log(
-                    "served required file: %s (%d/%d)"
-                    % (
-                        rel_path,
-                        seen_count,
-                        total_count,
-                    )
-                )
+        def _serve(self, body):
+            name = self._asset_name()
+            if name == "manifest.json":
+                data, ctype = session.manifest(), "application/json"
+            elif name in session.assets:
+                data = session.assets[name]
+                ctype = "text/html; charset=utf-8" if name == ENTRY_PAGE else "application/octet-stream"
+            else:
+                self._headers(404)
+                return
+            self._headers(200, len(data), ctype)
+            if body:
+                self.wfile.write(data)
+                self.wfile.flush()
+                if name in session.assets:
+                    session.tracker.mark_seen(name)
 
-        def send_head(self):
-            rel_path = self._requested_rel_path()
-            if rel_path is None or rel_path not in tracked:
-                self.send_error(404, "File not found")
-                return None
+        def do_GET(self):
+            self._serve(True)
 
-            data = None
-            if allow_embedded_assets:
-                data = _read_embedded_file(rel_path)
-            if data is None and allow_filesystem_fallback:
-                data = _read_filesystem_file(root_dir, rel_path)
-            if data is None:
-                self.send_error(404, "File not found")
-                return None
+        def do_HEAD(self):
+            self._serve(False)
 
-            self._mark_served_file(rel_path)
-            return self._send_bytes(rel_path, data)
+        def do_POST(self):
+            if self._asset_name() != "result":
+                self._headers(404)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                # Consume a bounded small error body so closing TLS does not
+                # discard the error response because of unread application data.
+                body = self.rfile.read(min(max(length, 0), 2049))
+                if not 0 < length <= 2048 or self.headers.get("Transfer-Encoding"):
+                    raise ValueError("invalid body length")
+                if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json":
+                    raise ValueError("invalid content type")
+                if len(body) != length:
+                    raise ValueError("incomplete body")
+                payload = json.loads(body)
+                session.receive_result(payload)
+            except (ValueError, UnicodeError):
+                self._headers(400)
+                return
+            self._headers(204)
 
-    return TrackingHTTPRequestHandler
-
-
-def start_http_server(
-    root_dir,
-    tracker,
-    tracked_files,
-    allow_embedded_assets,
-    allow_filesystem_fallback,
-    bind_host="0.0.0.0",
-    preferred_port=8080,
-):
-    """Start a tiny static file server rooted at root_dir."""
-    handler = make_tracking_handler(
-        root_dir,
-        tracker,
-        tracked_files,
-        allow_embedded_assets,
-        allow_filesystem_fallback,
-    )
-    return _start_http_server(handler, bind_host, preferred_port)
+    return Handler
 
 
-def _start_http_server(handler, bind_host, preferred_port):
-    server = None
+class BoundedTLSServer(ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
+
+    def __init__(self, address, handler, context):
+        self.tls_context = context
+        self._slots = threading.BoundedSemaphore(8)
+        super().__init__(address, handler)
+
+    def get_request(self):
+        sock, address = super().get_request()
+        sock.settimeout(5.0)
+        return sock, address
+
+    def process_request(self, request, address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            self._slots.release()
+
+    def handle_error(self, request, address):
+        # Timeouts, invalid TLS and disconnects are expected on a LAN listener.
+        pass
+
+
+def start_http_server(session, bind_host, certfile, keyfile, preferred_port=8080):
+    if not certfile or not keyfile:
+        raise RuntimeError("HTTPS certificate and private key are required for executable assets")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(certfile, keyfile)
+    handler = make_tracking_handler(session)
     for port in (preferred_port, 0):
         try:
-            server = HTTPServer((bind_host, port), handler)
+            server = BoundedTLSServer((bind_host, port), handler, context)
             break
         except OSError:
-            server = None
-    if server is None:
-        raise RuntimeError("could not start local HTTP server")
-
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+            if port == 0:
+                raise
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
 
-def build_self_hosted_url(
-    tv_host,
-    server_port,
-    debug=False,
-    local_ip_override=None,
-    curl_insecure=False,
-    fake_service_path=DEFAULT_FAKE_SERVICE_PATH,
-):
-    local_ip = local_ip_override or local_ip_for_remote(tv_host)
-    url = "http://%s:%d/%s" % (local_ip, server_port, ENTRY_PAGE)
-    url += "?script=%s&files=%s" % (SHELL_SCRIPT, ";".join(SERVICE_FILES))
+def verify_payload_certificate(server, bind_ip, hostname):
+    # Fail before pairing if this computer cannot validate the payload server's
+    # chain, validity period and DNS name. The TV must also trust this CA.
+    context = ssl.create_default_context()
+    with socket.create_connection((bind_ip, server.server_port), 5.0) as raw:
+        with context.wrap_socket(raw, server_hostname=hostname):
+            pass
+
+
+def _start_http_server(handler, bind_host, preferred_port):
+    # Plain HTTP is retained exclusively for the fixed-text diagnostic.
+    for port in (preferred_port, 0):
+        try:
+            server = ThreadingHTTPServer((bind_host, port), handler)
+            break
+        except OSError:
+            if port == 0:
+                raise
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+class HTTPSOnlyRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urlsplit(newurl).scheme != "https":
+            raise RuntimeError("package download attempted a non-HTTPS redirect")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def load_hbchannel_ipk(path=None):
+    if path:
+        with open(path, "rb") as stream:
+            data = stream.read(MAX_PACKAGE_BYTES + 1)
+    else:
+        opener = build_opener(HTTPSOnlyRedirectHandler(), HTTPSHandler(context=ssl.create_default_context()))
+        deadline = time.monotonic() + 120
+        chunks, size = [], 0
+        with opener.open(Request(HBC_URL, headers={"User-Agent": "SlopBro-security-fork"}), timeout=15) as stream:
+            if stream.status != 200 or urlsplit(stream.geturl()).scheme != "https":
+                raise RuntimeError("package download did not return an HTTPS 200 response")
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_PACKAGE_BYTES or time.monotonic() > deadline:
+                    raise RuntimeError("package download exceeded its size or time limit")
+                chunks.append(chunk)
+        data = b"".join(chunks)
+    if len(data) > MAX_PACKAGE_BYTES or not hmac.compare_digest(sha256(data).hexdigest(), HBC_SHA256):
+        raise RuntimeError("Homebrew Channel package SHA-256 mismatch; no TV changes made")
+    return data
+
+
+def load_session_assets(asset_source, ipk_path=None):
+    names = required_files()
+    root, _, embedded, filesystem = resolve_asset_root(asset_source, names)
+    assets = {}
+    for name in names:
+        data = _read_embedded_file(name) if embedded else None
+        if data is None and filesystem:
+            data = _read_filesystem_file(root, name)
+        if data is None:
+            raise RuntimeError("missing executable asset: %s" % name)
+        assets[name] = data
+    assets[HBC_NAME] = load_hbchannel_ipk(ipk_path)
+    return assets
+
+
+def build_self_hosted_url(payload_host, server_port, session, debug=False,
+                          fake_service_path=DEFAULT_FAKE_SERVICE_PATH):
+    query = {"fake-service-path": fake_service_path} if fake_service_path else {}
     if debug:
-        url += "&debug"
-    if curl_insecure:
-        url += "&curl-insecure"
-    if fake_service_path:
-        url += "&fake-service-path=%s" % fake_service_path
-    return url
+        query["debug"] = "1"
+    url = "https://%s:%d/%s/%s" % (payload_host, server_port, session.token, ENTRY_PAGE)
+    return url + ("?" + urlencode(query) if query else "")
 
 
 def _validate_ipv4_address(ip_text):
@@ -918,312 +1118,140 @@ def run_test_connection(host=None, local_ip_override=None):
                 pass
 
 
-def run_test_payload(
-    host=None,
-    debug=False,
-    asset_source=ASSET_SOURCE_AUTO,
-    local_ip_override=None,
-    curl_insecure=False,
-    fake_service_path=DEFAULT_FAKE_SERVICE_PATH,
-):
-    """Serve the payload page and print its URL without pairing/launching.
-
-    Lets the user manually open the URL in the TV's web browser (or any
-    browser on the LAN) to confirm that the payload/exploit files are served
-    correctly, without needing a working SSAP connection first. host is
-    recommended, since it's used to guess the local IP to listen on.
-    """
-    if not host:
-        log(
-            "warning: no <tv-ip-or-host> given; the guessed local IP may be "
-            "wrong (recommended: pass the TV's IP address)"
-        )
-
-    tracked_files = required_files()
-    wwwroot_dir = None
-    asset_source_used = None
-    allow_embedded_assets = True
-    allow_filesystem_fallback = True
-    http_server = None
-    page_url = None
+def run_test_payload(host, tls_cert, tls_key, payload_host, hbchannel_ipk=None,
+                     local_ip_override=None, asset_source=ASSET_SOURCE_AUTO,
+                     debug=False, fake_service_path=DEFAULT_FAKE_SERVICE_PATH):
+    assets = load_session_assets(asset_source, hbchannel_ipk)
+    session = SecureSession(assets, socket.gethostbyname(host), debug)
+    bind_ip = guess_local_ip(host, local_ip_override)
+    server = start_http_server(session, bind_ip, tls_cert, tls_key)
     try:
-        (
-            wwwroot_dir,
-            asset_source_used,
-            allow_embedded_assets,
-            allow_filesystem_fallback,
-        ) = resolve_asset_root(asset_source, tracked_files)
-    except RuntimeError as exc:
-        die("%s" % exc)
-
-    tracker = RequestedFilesTracker(tracked_files)
-    try:
-        http_server = start_http_server(
-            wwwroot_dir,
-            tracker,
-            tracked_files,
-            allow_embedded_assets,
-            allow_filesystem_fallback,
-        )
-        local_ip = guess_local_ip(
-            target_host=host, local_ip_override=local_ip_override
-        )
-        page_url = build_self_hosted_url(
-            host,
-            http_server.server_port,
-            debug=debug,
-            curl_insecure=curl_insecure,
-            local_ip_override=local_ip,
-            fake_service_path=fake_service_path,
-        )
-    except Exception as exc:
-        die("could not start self-hosted page server: %s" % exc)
-
-    log(
-        "test mode: serving files from %s (source=%s)"
-        % (wwwroot_dir, asset_source_used)
-    )
-    log("open this URL in the TV's web browser to test the payload:")
-    log("    %s" % page_url)
-    log("press Ctrl+C to stop")
-
-    try:
+        verify_payload_certificate(server, bind_ip, payload_host)
+        url = build_self_hosted_url(payload_host, server.server_port, session, debug, fake_service_path)
+        log("HTTPS payload diagnostic; no pairing or app launch is performed")
+        log("Private session URL (do not share): %s" % url)
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        log("stopping test server")
+        pass
     finally:
-        if http_server is not None:
-            try:
-                http_server.shutdown()
-            except Exception:
-                pass
-            try:
-                http_server.server_close()
-            except Exception:
-                pass
+        server.shutdown()
+        server.server_close()
 
 
-def run(
-    host,
-    debug=False,
-    asset_source=ASSET_SOURCE_AUTO,
-    local_ip_override=None,
-    webos_version_override=None,
-    curl_insecure=False,
-    fake_service_path=DEFAULT_FAKE_SERVICE_PATH,
-):
-    secure = True
-    port = PORT_TLS if secure else PORT_PLAIN
-    scheme = "wss" if secure else "ws"
-    log("connecting to %s://%s:%d" % (scheme, host, port))
-
-    tracked_files = required_files()
-    wwwroot_dir = None
-    asset_source_used = None
-    allow_embedded_assets = True
-    allow_filesystem_fallback = True
-    http_server = None
-    page_url = None
-    ws = None
-    new_key = ""
-    result = {}
+def run(host, tls_cert, tls_key, payload_host, tv_cert_sha256,
+        hbchannel_ipk=None, debug=False, asset_source=ASSET_SOURCE_AUTO,
+        local_ip_override=None, webos_version_override=None,
+        operation_timeout=180.0, fake_service_path=DEFAULT_FAKE_SERVICE_PATH):
+    if not webos_version_override:
+        raise RuntimeError("specify the TV's internal webOS version with --webos-version")
+    candidates = target_apps_for_webos_version(TARGET_APPS, webos_version_override)
+    if not candidates:
+        raise RuntimeError("no configured apps for this internal webOS version")
+    assets = load_session_assets(asset_source, hbchannel_ipk)
+    session = SecureSession(assets, socket.gethostbyname(host), debug)
+    bind_ip = guess_local_ip(host, local_ip_override)
+    server = start_http_server(session, bind_ip, tls_cert, tls_key)
+    client = None
     try:
-        (
-            wwwroot_dir,
-            asset_source_used,
-            allow_embedded_assets,
-            allow_filesystem_fallback,
-        ) = resolve_asset_root(
-            asset_source,
-            tracked_files,
-        )
-    except RuntimeError as exc:
-        die("%s" % exc)
-
-    tracker = RequestedFilesTracker(tracked_files)
-    if tracked_files:
-        log(
-            "tracking %d files in %s (source=%s)"
-            % (len(tracked_files), wwwroot_dir, asset_source_used)
-        )
-    else:
-        log("warning: no files found in %s" % wwwroot_dir)
-    try:
-        http_server = start_http_server(
-            wwwroot_dir,
-            tracker,
-            tracked_files,
-            allow_embedded_assets,
-            allow_filesystem_fallback,
-        )
-        page_url = build_self_hosted_url(
-            host,
-            http_server.server_port,
-            debug=debug,
-            curl_insecure=curl_insecure,
-            local_ip_override=local_ip_override,
-            fake_service_path=fake_service_path,
-        )
-    except Exception as exc:
-        die("could not start self-hosted page server: %s" % exc)
-    log("serving files from %s at %s" % (wwwroot_dir, page_url))
-
-    try:
-        ws = WebSocket.connect(
-            host,
-            port,
-            secure=secure,
-        )
-    except (OSError, WebSocketError) as exc:
-        die("could not connect to TV: %s" % exc)
-
-    client = SSAPClient(ws)
-    try:
-        stored_key = load_client_key(host)
-        if stored_key:
-            log("using stored client key")
-        else:
-            log("no stored client key; pairing will be requested")
-
-        try:
-            new_key = client.register(stored_key, DEFAULT_MANIFEST)
-        except SSAPError as exc:
-            die("registration failed: %s" % exc)
-
-        if new_key and new_key != stored_key:
-            save_client_key(host, new_key)
-            log("registered; client key saved")
-        else:
-            log("registered")
-
-        webos_version = None
-        if webos_version_override:
-            webos_version = webos_version_override
-            log("using forced webOS version: %s" % webos_version)
-        elif False:
-            # TODO: Fix and re-enable.
-            webos_version = get_webos_version(client)
-            if webos_version:
-                log("detected webOS version: %s" % webos_version)
-
-        target_apps = []
-        try:
-            target_apps = target_apps_for_webos_version(TARGET_APPS, webos_version)
-        except ValueError as exc:
-            die("%s" % exc)
-        if not target_apps:
-            die("no target apps configured for webOS %s" % webos_version)
-        app_id, url_param_name = verify_app_present(client, target_apps)
-
-        log("launching %s -> %s" % (app_id, page_url))
-        try:
-            result = launch_app(client, app_id, {url_param_name: page_url})
-        except SSAPError as exc:
-            die("%s" % exc)
-
+        verify_payload_certificate(server, bind_ip, payload_host)
+        page_url = build_self_hosted_url(payload_host, server.server_port, session, debug, fake_service_path)
+        log("serving authenticated HTTPS assets on %s:%d for the selected TV" % (bind_ip, server.server_port))
+        ws = WebSocket.connect(host, PORT_TLS, fingerprint=tv_cert_sha256)
+        client = SSAPClient(ws)
+        stored = load_client_key(host)
+        key = client.register(stored, DEFAULT_MANIFEST)
+        if key and key != stored:
+            save_client_key(host, key)
+        app_id, param = verify_app_present(client, candidates)
+        log("launching %s; waiting for the installer's verified terminal result" % app_id)
+        launch_app(client, app_id, {param: page_url})
+        result = session.wait(operation_timeout)
         print(json.dumps(result, sort_keys=True))
-
-        log("waiting for all tracked files to be requested")
-        tracker.wait_for_all(None)
-        log("done; all tracked files were requested (❛ ᴗ ❛)")
+        log("installer completed and current root was verified; reboot persistence was not tested")
+        return result
     finally:
-        client.close()
-        if http_server is not None:
-            try:
-                http_server.shutdown()
-            except Exception:
-                pass
-            try:
-                http_server.server_close()
-            except Exception:
-                pass
+        if client is not None:
+            client.close()
+        server.shutdown()
+        server.server_close()
 
 
 def _fake_service_path_arg(value):
-    if not value.strip():
-        raise argparse.ArgumentTypeError("value must not be empty")
+    if not re.fullmatch(r"/[A-Za-z0-9_./-]+", value) or ".." in value.split("/"):
+        raise argparse.ArgumentTypeError("use an absolute path without spaces, traversal or shell metacharacters")
     return value
 
 
+def _fingerprint_arg(value):
+    normalized = value.replace(":", "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+        raise argparse.ArgumentTypeError("expected a SHA-256 certificate fingerprint")
+    return normalized
+
+
+def _hostname_arg(value):
+    labels = value.split(".")
+    if len(value) > 253 or any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) for label in labels):
+        raise argparse.ArgumentTypeError("expected a DNS hostname or IPv4 address, without a URL or port")
+    return value
+
+
+def _positive_timeout(value):
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a positive timeout")
+    if not 1 <= seconds <= 600:
+        raise argparse.ArgumentTypeError("timeout must be between 1 and 600 seconds")
+    return seconds
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(
-        description="Pair with an LG webOS TV and launch a self-hosted payload page.",
-        add_help=False,
-    )
-    parser.add_argument(
-        "-h", "--help", "-?", action="help",
-        help="show this help message and exit",
-    )
-    parser.add_argument(
-        "--debug", action="store_true", help="enable payload debug output",
-    )
-    parser.add_argument(
-        "--curl-insecure", action="store_true",
-        help="disable curl TLS certificate verification for payload downloads",
-    )
-    parser.add_argument(
-        "--fake-service-path", metavar="<path>",
-        default=DEFAULT_FAKE_SERVICE_PATH, type=_fake_service_path_arg,
-        help="fake service path used to bypass the service launch patch",
-    )
-    parser.add_argument(
-        "--no-fake-service-path", dest="fake_service_path",
-        action="store_const", const="",
-        help="disable the fake service path bypass",
-    )
-    parser.add_argument(
-        "--asset-source", choices=ASSET_SOURCES, default=ASSET_SOURCE_AUTO,
-        help="asset location (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--local-ip", metavar="<ipv4>",
-        help="override the advertised local IPv4 address",
-    )
-    parser.add_argument(
-        "--webos-version", metavar="<version>",
-        help="limit target apps by webOS version (e.g. 6.5); not auto-detected",
-    )
-    parser.add_argument(
-        "--test-server", choices=TEST_SERVER_MODES,
-        help="serve a connectivity response (simple) or payload without pairing",
-    )
-    parser.add_argument(
-        "host", nargs="?", metavar="<tv-ip-or-host>",
-        help="TV address (required except in test-server modes; recommended there)",
-    )
+    parser = argparse.ArgumentParser(description="Security-hardened SlopBro: verified HTTPS payloads and closed remote-access defaults")
+    parser.add_argument("host", nargs="?", type=_hostname_arg, metavar="<tv-ip-or-host>")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--tls-cert", help="payload server's trusted certificate chain (PEM)")
+    parser.add_argument("--tls-key", help="payload server's private key (PEM)")
+    parser.add_argument("--payload-host", type=_hostname_arg, help="TV-resolvable hostname matching the trusted HTTPS certificate")
+    parser.add_argument("--tv-cert-sha256", type=_fingerprint_arg, help="TV certificate fingerprint verified through a trusted channel")
+    parser.add_argument("--hbchannel-ipk", help="local Homebrew Channel v0.7.3 package; its pinned SHA-256 is always checked")
+    parser.add_argument("--local-ip", help="local IPv4 interface to bind")
+    parser.add_argument("--webos-version", help="internal webOS version (for example 10), not an LG firmware number")
+    parser.add_argument("--operation-timeout", type=_positive_timeout, default=180.0)
+    parser.add_argument("--asset-source", choices=ASSET_SOURCES, default=ASSET_SOURCE_AUTO)
+    parser.add_argument("--fake-service-path", type=_fake_service_path_arg, default=DEFAULT_FAKE_SERVICE_PATH)
+    parser.add_argument("--no-fake-service-path", dest="fake_service_path", action="store_const", const="")
+    parser.add_argument("--test-server", choices=TEST_SERVER_MODES)
     args = parser.parse_args(argv)
     if args.local_ip is not None and not _validate_ipv4_address(args.local_ip):
-        parser.error("invalid --local-ip value '%s'" % args.local_ip)
-    if args.webos_version is not None and not args.webos_version.strip():
-        parser.error("--webos-version value must not be empty")
-    if args.test_server is None and args.host is None:
-        parser.error("<tv-ip-or-host> is required unless --test-server is used")
-
-    if args.test_server == TEST_SERVER_SIMPLE:
-        run_test_connection(
-            args.host,
-            local_ip_override=args.local_ip,
-        )
-    elif args.test_server == TEST_SERVER_PAYLOAD:
-        run_test_payload(
-            args.host,
-            debug=args.debug,
-            asset_source=args.asset_source,
-            local_ip_override=args.local_ip,
-            curl_insecure=args.curl_insecure,
-            fake_service_path=args.fake_service_path,
-        )
-    else:
-        run(
-            args.host,
-            debug=args.debug,
-            asset_source=args.asset_source,
-            local_ip_override=args.local_ip,
-            webos_version_override=args.webos_version,
-            curl_insecure=args.curl_insecure,
-            fake_service_path=args.fake_service_path,
-        )
+        parser.error("invalid --local-ip value")
+    if args.test_server != TEST_SERVER_SIMPLE:
+        for name in ("host", "tls_cert", "tls_key", "payload_host"):
+            if not getattr(args, name):
+                parser.error("%s is required for executable payloads" % name.replace("_", "-"))
+        if args.test_server is None and (not args.tv_cert_sha256 or not args.webos_version):
+            parser.error("--tv-cert-sha256 and --webos-version are required before pairing")
+    try:
+        if args.test_server == TEST_SERVER_SIMPLE:
+            run_test_connection(args.host, local_ip_override=args.local_ip)
+        elif args.test_server == TEST_SERVER_PAYLOAD:
+            run_test_payload(args.host, args.tls_cert, args.tls_key, args.payload_host,
+                hbchannel_ipk=args.hbchannel_ipk, local_ip_override=args.local_ip,
+                asset_source=args.asset_source, debug=args.debug,
+                fake_service_path=args.fake_service_path)
+        else:
+            run(args.host, args.tls_cert, args.tls_key, args.payload_host, args.tv_cert_sha256,
+                hbchannel_ipk=args.hbchannel_ipk, local_ip_override=args.local_ip,
+                asset_source=args.asset_source, debug=args.debug,
+                fake_service_path=args.fake_service_path,
+                webos_version_override=args.webos_version, operation_timeout=args.operation_timeout)
+    except (OSError, RuntimeError, ValueError, SSAPError, WebSocketError) as exc:
+        log("error: %s" % exc)
+        return 1
+    except KeyboardInterrupt:
+        log("interrupted; inspect the TV's state before retrying")
+        return 130
     return 0
 
 

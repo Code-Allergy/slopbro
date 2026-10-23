@@ -29,6 +29,8 @@ DEFAULT_FILES = [
     "autoroot.sh",
     "package.json",
     "main.js",
+    "luna-helper.js",
+    "hbchannel-startup.sh",
 ]
 
 

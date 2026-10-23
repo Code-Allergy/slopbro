@@ -1,256 +1,302 @@
+"""Offline security regressions. No TV, live download, or installer is invoked."""
+import base64
+import hashlib
+import http.client
+import importlib.util
 import io
+import json
 import os
+from pathlib import Path
+import socket
 import ssl
+import struct
+import subprocess
 import tempfile
+import time
 import unittest
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
+from urllib.request import Request
 
 import slopbro
 
+ROOT = Path(__file__).resolve().parents[1]
 
-class CommandLineTests(unittest.TestCase):
+
+class SessionTests(unittest.TestCase):
     def setUp(self):
-        self.runners = {}
-        for name in ("run", "run_test_connection", "run_test_payload"):
-            patcher = patch.object(slopbro, name)
-            self.runners[name] = patcher.start()
-            self.addCleanup(patcher.stop)
+        self.session = slopbro.SecureSession({'index.html': b'page', 'main.js': b'code'}, '127.0.0.1')
 
-    def test_normal_defaults(self):
-        self.assertEqual(slopbro.main(["tv.local"]), 0)
-        self.runners["run"].assert_called_once_with(
-            "tv.local", debug=False, asset_source="auto",
-            local_ip_override=None, webos_version_override=None,
-            curl_insecure=False, fake_service_path=slopbro.DEFAULT_FAKE_SERVICE_PATH,
-        )
-        self.runners["run_test_connection"].assert_not_called()
-        self.runners["run_test_payload"].assert_not_called()
+    def test_transfers_are_not_an_install_result(self):
+        for name in self.session.assets:
+            self.session.tracker.mark_seen(name)
+        with self.assertRaisesRegex(RuntimeError, 'no terminal'):
+            self.session.wait(0.001)
 
-    def test_option_value_forms(self):
-        for equals in (False, True):
-            argv = ["--debug", "tv.local", "--curl-insecure"]
-            for option, value in (
-                ("--local-ip", "192.168.1.2"),
-                ("--asset-source", "dir"),
-                ("--webos-version", "6.5"),
-            ):
-                argv.extend([option + "=" + value] if equals else [option, value])
-            self.assertEqual(slopbro.main(argv), 0)
-            self.runners["run"].assert_called_with(
-                "tv.local", debug=True, asset_source="dir",
-                local_ip_override="192.168.1.2", webos_version_override="6.5",
-                curl_insecure=True, fake_service_path=slopbro.DEFAULT_FAKE_SERVICE_PATH,
-            )
+    def test_success_requires_root_check_and_all_transfers(self):
+        for payload in ({'ok': True, 'root_verified': True, 'phase': 'complete'},
+                        {'ok': True, 'root_verified': False, 'phase': 'complete'}):
+            with self.assertRaises(ValueError):
+                self.session.receive_result(payload)
+        for name in self.session.assets:
+            self.session.tracker.mark_seen(name)
+        self.session.receive_result({'ok': True, 'root_verified': True, 'phase': 'complete'})
+        self.assertFalse(self.session.wait(0.01)['reboot_verified'])
+        with self.assertRaises(ValueError):
+            self.session.receive_result({'ok': True, 'root_verified': True, 'phase': 'complete'})
 
-    def test_fake_service_path_options(self):
-        for argv, expected in (
-            (["--fake-service-path", "/custom/service"], "/custom/service"),
-            (["--fake-service-path=/custom/service"], "/custom/service"),
-            (["--no-fake-service-path"], ""),
-            (["--fake-service-path=/custom/service", "--no-fake-service-path"], ""),
-            (["--no-fake-service-path", "--fake-service-path=/custom/service"], "/custom/service"),
-        ):
-            with self.subTest(argv=argv):
-                self.assertEqual(slopbro.main(argv + ["tv.local"]), 0)
-                self.assertEqual(self.runners["run"].call_args.kwargs["fake_service_path"], expected)
+    def test_negative_result_before_any_download(self):
+        self.session.receive_result({'ok': False, 'root_verified': False, 'phase': 'page', 'error': 'download failed'})
+        with self.assertRaisesRegex(RuntimeError, 'page: download failed'):
+            self.session.wait(0.01)
 
-        self.assertEqual(slopbro.main([
-            "--test-server=payload", "--no-fake-service-path",
-        ]), 0)
-        self.assertEqual(self.runners["run_test_payload"].call_args.kwargs["fake_service_path"], "")
+    def test_receipt_schema_is_strict(self):
+        for value in (None, [], {}, {'ok': 1, 'root_verified': True, 'phase': 'complete'},
+                      {'ok': False, 'root_verified': False, 'phase': 'x', 'extra': 1},
+                      {'ok': False, 'root_verified': False, 'phase': 'x', 'error': 'x' * 501}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.session.receive_result(value)
 
-    def test_test_server_modes(self):
-        for host in (None, "tv.local"):
-            positional = [host] if host else []
-            self.assertEqual(slopbro.main(["--test-server", "simple"] + positional), 0)
-            self.runners["run_test_connection"].assert_called_with(
-                host, local_ip_override=None,
-            )
-            self.assertEqual(slopbro.main([
-                "--test-server=payload", "--debug", "--curl-insecure",
-                "--asset-source=embedded", "--local-ip=192.168.1.2",
-            ] + positional), 0)
-            self.runners["run_test_payload"].assert_called_with(
-                host, debug=True, asset_source="embedded",
-                local_ip_override="192.168.1.2", curl_insecure=True,
-                fake_service_path=slopbro.DEFAULT_FAKE_SERVICE_PATH,
-            )
-        self.runners["run"].assert_not_called()
-
-    def test_help_aliases(self):
-        for option in ("--help", "-h", "-?"):
-            with patch("sys.stdout", new_callable=io.StringIO) as output:
-                with self.assertRaises(SystemExit) as caught:
-                    slopbro.main([option])
-            self.assertEqual(caught.exception.code, 0)
-            self.assertIn("--test-server", output.getvalue())
-            self.assertIn("--no-fake-service-path", output.getvalue())
-        for runner in self.runners.values():
-            runner.assert_not_called()
-
-    def test_invalid_arguments(self):
-        invalid = [
-            [], ["tv", "extra"], ["--unknown"],
-            ["--asset-source=bad", "tv"], ["--test-server=bad"],
-            ["--local-ip=bad", "tv"], ["--local-ip=", "tv"],
-            ["--webos-version=", "tv"], ["--webos-version", " ", "tv"],
-            ["--fake-service-path=", "tv"],
-            ["--fake-service-path", " ", "tv"],
-        ]
-        invalid.extend([[option] for option in (
-            "--local-ip", "--webos-version", "--asset-source", "--test-server",
-            "--fake-service-path",
-        )])
-        for argv in invalid:
-            with patch("sys.stderr", new_callable=io.StringIO) as output:
-                with self.assertRaises(SystemExit) as caught:
-                    slopbro.main(argv)
-            self.assertEqual(caught.exception.code, 2, argv)
-            self.assertIn("error:", output.getvalue())
-        for runner in self.runners.values():
-            runner.assert_not_called()
-
-    def test_default_argv(self):
-        with patch("sys.argv", ["slopbro.py", "tv.local"]):
-            self.assertEqual(slopbro.main(), 0)
-        self.runners["run"].assert_called_once()
+    def test_manifest_snapshots_bytes_and_session_is_unpredictable(self):
+        other = slopbro.SecureSession(self.session.assets, '127.0.0.1')
+        self.assertNotEqual(self.session.token, other.token)
+        manifest = json.loads(self.session.manifest())
+        self.assertEqual(manifest['files'], ['main.js'])
+        self.assertEqual(manifest['sha256']['main.js'], hashlib.sha256(b'code').hexdigest())
+        url = slopbro.build_self_hosted_url('payload.example', 8443, self.session)
+        self.assertTrue(url.startswith('https://payload.example:8443/' + self.session.token + '/index.html?'))
 
 
-class HandlerTests(unittest.TestCase):
-    def test_server_startup(self):
-        for mode in ("payload", "simple"):
-            for failed_attempts in (0, 1, 2):
-                with self.subTest(mode=mode, failed_attempts=failed_attempts):
-                    server = Mock()
-                    outcomes = [OSError("port unavailable")] * failed_attempts
-                    if failed_attempts < 2:
-                        outcomes.append(server)
-                    with patch.object(slopbro, "HTTPServer", side_effect=outcomes) as factory:
-                        with patch.object(slopbro.threading, "Thread") as thread:
-                            if mode == "simple":
-                                starter = slopbro.start_test_connection_server
-                                args = ()
-                            else:
-                                starter = slopbro.start_http_server
-                                args = (None, None, [], True, False)
-                            if failed_attempts == 2:
-                                with self.assertRaisesRegex(RuntimeError, "could not start"):
-                                    starter(*args, bind_host="127.0.0.1", preferred_port=9000)
-                                thread.assert_not_called()
-                            else:
-                                self.assertIs(
-                                    starter(*args, bind_host="127.0.0.1", preferred_port=9000),
-                                    server,
-                                )
-                                thread.assert_called_once_with(
-                                    target=server.serve_forever, daemon=True,
-                                )
-                                thread.return_value.start.assert_called_once_with()
-                    handler = factory.call_args_list[0][0][1]
-                    ports = [9000] if failed_attempts == 0 else [9000, 0]
-                    self.assertEqual(factory.call_args_list, [
-                        call(("127.0.0.1", port), handler) for port in ports
-                    ])
+class TLSHandlerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        cls.cert = Path(cls.directory.name) / 'cert.pem'
+        cls.key = Path(cls.directory.name) / 'key.pem'
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+                        '-keyout', str(cls.key), '-out', str(cls.cert), '-days', '1',
+                        '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1',
+                        '-addext', 'basicConstraints=critical,CA:TRUE'],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cls.context = ssl.create_default_context(cafile=str(cls.cert))
 
-    def test_requested_paths(self):
-        handler_class = slopbro.make_tracking_handler(
-            None, slopbro.RequestedFilesTracker(slopbro.required_files()),
-            slopbro.required_files(), True, False,
-        )
-        handler = object.__new__(handler_class)
-        for path, expected in (
-            ("/", "index.html"),
-            ("/index%2Ehtml?debug", "index.html"),
-            ("/caf%C3%A9", "caf\u00e9"),
-            ("/%ED%A0%80", "\ud800"),
-            ("../missing", None),
-        ):
-            handler.path = path
-            self.assertEqual(handler._requested_rel_path(), expected)
+    @classmethod
+    def tearDownClass(cls):
+        cls.directory.cleanup()
 
-    def test_connection_logging(self):
-        handler = object.__new__(slopbro.make_test_connection_handler())
-        handler.client_address = ("127.0.0.1", 12345)
-        with patch.object(slopbro, "log") as logger:
-            handler.log_message("status %s", 200)
-        logger.assert_called_once_with("request from 127.0.0.1: status 200")
+    def setUp(self):
+        self.session = slopbro.SecureSession({'index.html': b'page', 'main.js': b'code'}, '127.0.0.1')
+        self.server = slopbro.start_http_server(self.session, '127.0.0.1', self.cert, self.key, preferred_port=0)
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def request(self, method, path=None, body=None, headers=None):
+        connection = http.client.HTTPSConnection('127.0.0.1', self.server.server_port, context=self.context, timeout=2)
+        connection.request(method, path or '/' + self.session.token + '/index.html', body, headers or {})
+        response = connection.getresponse()
+        result = response.status, response.read(), dict(response.getheaders())
+        connection.close()
+        return result
+
+    def test_capability_paths_and_source_ip(self):
+        for path in ('/index.html', '/' + '0' * 64 + '/index.html', '/' + self.session.token + '/../main.js',
+                     '/' + self.session.token + '/%69ndex.html', '/' + self.session.token + '/missing'):
+            self.assertEqual(self.request('GET', path)[0], 404)
+        self.session.peer_ip = '192.0.2.1'
+        self.assertEqual(self.request('GET')[0], 404)
+
+    def test_head_does_not_count_and_assets_are_not_mutable(self):
+        status, body, headers = self.request('HEAD')
+        self.assertEqual((status, body), (200, b''))
+        self.assertEqual(self.session.tracker.missing_files(), ['index.html', 'main.js'])
+        status, body, headers = self.request('GET')
+        self.assertEqual((status, body), (200, b'page'))
+        self.assertEqual(headers['Cache-Control'], 'no-store')
+        self.assertEqual(self.session.tracker.missing_files(), ['main.js'])
+
+    def test_result_endpoint_checks_body_and_completion(self):
+        path = '/' + self.session.token + '/result'
+        good = {'ok': True, 'root_verified': True, 'phase': 'complete'}
+        self.assertEqual(self.request('POST', path, json.dumps(good), {'Content-Type': 'application/json'})[0], 400)
+        self.request('GET')
+        self.request('GET', '/' + self.session.token + '/main.js')
+        # Sending files alone still leaves the launcher waiting.
+        self.assertIsNone(self.session.result)
+        for body, content_type in (('not json', 'application/json'), ('{}', 'text/plain'), ('x' * 2049, 'application/json')):
+            self.assertEqual(self.request('POST', path, body, {'Content-Type': content_type})[0], 400)
+        self.assertEqual(self.request('POST', path, json.dumps(good), {'Content-Type': 'application/json'})[0], 204)
+        self.assertTrue(self.session.wait(0.01)['ok'])
+
+    def test_stalled_client_does_not_block_other_clients(self):
+        raw = socket.create_connection(('127.0.0.1', self.server.server_port), 2)
+        try:
+            self.assertEqual(self.request('GET')[0], 200)
+        finally:
+            raw.close()
+
+    def test_certificate_chain_and_hostname_must_be_trusted(self):
+        with patch.dict(os.environ, {'SSL_CERT_FILE': str(self.cert)}):
+            slopbro.verify_payload_certificate(self.server, '127.0.0.1', 'localhost')
+            with self.assertRaises(ssl.SSLCertVerificationError):
+                slopbro.verify_payload_certificate(self.server, '127.0.0.1', 'wrong.example')
+        with self.assertRaises(ssl.SSLCertVerificationError):
+            slopbro.verify_payload_certificate(self.server, '127.0.0.1', 'localhost')
+
+    def test_plain_http_cannot_read_payload(self):
+        client = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=2)
+        try:
+            with self.assertRaises((ConnectionError, http.client.HTTPException)):
+                client.request('GET', '/' + self.session.token + '/main.js')
+                client.getresponse()
+        finally:
+            client.close()
+
+    def test_missing_certificate_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, 'certificate'):
+            slopbro.start_http_server(self.session, '127.0.0.1', None, None)
 
 
-class Python3CleanupTests(unittest.TestCase):
-    def test_websocket_frame_masking(self):
+class DownloadAndKeyTests(unittest.TestCase):
+    def test_local_package_digest_is_mandatory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'hbc.ipk'
+            path.write_bytes(b'tampered')
+            with self.assertRaisesRegex(RuntimeError, 'SHA-256 mismatch'):
+                slopbro.load_hbchannel_ipk(path)
+            # Test a valid fixture without downloading or redistributing HBC.
+            with patch.object(slopbro, 'HBC_SHA256', hashlib.sha256(b'tampered').hexdigest()):
+                self.assertEqual(slopbro.load_hbchannel_ipk(path), b'tampered')
+
+    def test_package_error_pages_and_downgrade_are_rejected(self):
+        response = Mock(status=404)
+        response.geturl.return_value = slopbro.HBC_URL
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        with patch.object(slopbro, 'build_opener') as build:
+            build.return_value.open.return_value = response
+            with self.assertRaisesRegex(RuntimeError, 'HTTPS 200'):
+                slopbro.load_hbchannel_ipk()
+            response.read.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, 'non-HTTPS'):
+            slopbro.HTTPSOnlyRedirectHandler().redirect_request(Request(slopbro.HBC_URL), None, 302, '', {}, 'http://evil.example/file')
+
+    def test_invalid_package_stops_before_pairing_or_listener(self):
+        with patch.object(slopbro, 'load_hbchannel_ipk', side_effect=RuntimeError('bad package')):
+            with patch.object(slopbro.WebSocket, 'connect') as connect, patch.object(slopbro, 'start_http_server') as server:
+                with self.assertRaisesRegex(RuntimeError, 'bad package'):
+                    slopbro.run('127.0.0.1', 'cert', 'key', 'localhost', '0' * 64, asset_source='dir', webos_version_override='9')
+                connect.assert_not_called()
+                server.assert_not_called()
+
+    def test_keys_are_private_and_symlinks_are_replaced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, victim = Path(directory) / 'tv.key', Path(directory) / 'victim'
+            victim.write_text('untouched')
+            path.symlink_to(victim)
+            with patch.object(slopbro, 'key_path', return_value=str(path)):
+                slopbro.save_client_key('tv', 'secret')
+                self.assertEqual(slopbro.load_client_key('tv'), 'secret')
+            self.assertFalse(path.is_symlink())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(victim.read_text(), 'untouched')
+
+    def test_embedded_assets_round_trip_and_include_security_policy(self):
+        spec = importlib.util.spec_from_file_location('packager', ROOT / 'tools/package_single_file.py')
+        packager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packager)
+        assets = packager._build_asset_map(ROOT / 'wwwroot', packager.DEFAULT_FILES)
+        self.assertEqual(set(assets), set(slopbro.required_files()))
+        for name, meta in assets.items():
+            self.assertEqual(base64.b64decode(meta['data']), (ROOT / 'wwwroot' / name).read_bytes())
+        self.assertIn('Permission is hereby granted', base64.b64decode(assets['hbchannel-startup.sh']['data']).decode())
+
+
+class WebSocketTests(unittest.TestCase):
+    def socket_for(self, frames):
+        sock = Mock()
+        sock.recv.side_effect = [frames]
+        return sock, slopbro.WebSocket(sock)
+
+    def test_fragmented_utf8_with_interleaved_ping(self):
+        sock, client = self.socket_for(b'\x01\x01\xc3\x89\x01?\x80\x01\xa9')
+        self.assertEqual(client.recv_text(timeout=1), 'é')
+        self.assertTrue(sock.sendall.called)  # Pong was sent.
+
+    def test_bad_fragmentation_masking_and_oversized_frames(self):
+        frames = (b'\x80\x01a', b'\x81\x80', b'\x09\x00', b'\xc1\x00',
+                  b'\x81\x7f' + struct.pack('!Q', slopbro.MAX_WS_BYTES + 1), b'\x81\x01\xff')
+        for frame in frames:
+            with self.subTest(frame=frame), self.assertRaises(slopbro.WebSocketError):
+                self.socket_for(frame)[1].recv_text(timeout=1)
+
+    def test_aggregate_fragment_limit(self):
+        with patch.object(slopbro, 'MAX_WS_BYTES', 3):
+            with self.assertRaisesRegex(slopbro.WebSocketError, 'message exceeds'):
+                self.socket_for(b'\x01\x02ab\x80\x02cd')[1].recv_text(timeout=1)
+
+    def test_ping_stream_cannot_extend_deadline(self):
         sock = Mock()
         client = slopbro.WebSocket(sock)
-        with patch.object(slopbro.os, "urandom", return_value=b"\x01\x02\x03\x04") as random:
-            client._send_frame(client.OP_TEXT, b"abc")
-        random.assert_called_once_with(4)
-        sock.sendall.assert_called_once_with(b"\x81\x83\x01\x02\x03\x04" + b"\x60" * 3)
+        with patch.object(client, '_read_frame', return_value=(True, 9, b'')):
+            with patch.object(slopbro.time, 'monotonic', side_effect=[0, 0.2, 1.1]):
+                with self.assertRaises(socket.timeout):
+                    client.recv_text(timeout=1)
 
-    def test_websocket_close_ignores_connection_errors(self):
-        for error_type in (OSError, ssl.SSLError, slopbro.WebSocketError):
-            with self.subTest(error_type=error_type):
-                sock = Mock()
-                sock.sendall.side_effect = error_type("disconnected")
-                sock.close.side_effect = OSError("already closed")
-                client = slopbro.WebSocket(sock)
-                client.close()
-                self.assertTrue(client.closed)
-                sock.close.assert_called_once_with()
+    def test_certificate_pin_checked_before_handshake(self):
+        with patch.object(slopbro.socket, 'create_connection') as connect:
+            with patch.object(ssl.SSLContext, 'wrap_socket', autospec=True) as wrap:
+                wrap.return_value.getpeercert.return_value = b'actual cert'
+                with patch.object(slopbro.WebSocket, '_handshake') as handshake:
+                    with self.assertRaisesRegex(slopbro.WebSocketError, 'fingerprint mismatch'):
+                        slopbro.WebSocket.connect('tv', 3001, fingerprint='0' * 64)
+                    handshake.assert_not_called()
+                    good = hashlib.sha256(b'actual cert').hexdigest()
+                    client = slopbro.WebSocket.connect('tv', 3001, fingerprint=good)
+                    handshake.assert_called_once()
+                    context = wrap.call_args.args[0]
+                    self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
+                    client.close()
 
-    def test_route_lookup_closes_socket(self):
-        for failure in (None, "connect", "getsockname"):
-            with self.subTest(failure=failure):
-                with patch.object(slopbro.socket, "socket") as factory:
-                    sock = factory.return_value.__enter__.return_value
-                    sock.getsockname.return_value = ("192.168.1.2", 12345)
-                    if failure:
-                        getattr(sock, failure).side_effect = OSError("no route")
-                    result = slopbro._route_selected_local_ip("192.168.1.50", 80)
-                self.assertEqual(result, None if failure else "192.168.1.2")
-                factory.assert_called_once_with(
-                    slopbro.socket.AF_INET, slopbro.socket.SOCK_DGRAM,
-                )
-                sock.connect.assert_called_once_with(("192.168.1.50", 80))
-                factory.return_value.__exit__.assert_called_once_with(None, None, None)
+    def test_no_pin_or_plaintext_refused_before_connection(self):
+        with patch.object(slopbro.socket, 'create_connection') as connect:
+            for kwargs in ({}, {'secure': False, 'fingerprint': '0' * 64}):
+                with self.assertRaises(slopbro.WebSocketError):
+                    slopbro.WebSocket.connect('tv', 3000, **kwargs)
+            connect.assert_not_called()
 
-    def test_tls_client_context(self):
-        with patch.object(slopbro.socket, "create_connection") as connect:
-            with patch.object(ssl.SSLContext, "wrap_socket", autospec=True) as wrap:
-                with patch.object(slopbro.WebSocket, "_handshake") as handshake:
-                    client = slopbro.WebSocket.connect("tv.local", 3001)
-        context = wrap.call_args[0][0]
-        self.assertEqual(context.protocol, ssl.PROTOCOL_TLS_CLIENT)
-        self.assertFalse(context.check_hostname)
-        self.assertEqual(context.verify_mode, ssl.CERT_NONE)
-        wrap.assert_called_once_with(
-            context, connect.return_value, server_hostname="tv.local",
-        )
-        self.assertIs(client._sock, wrap.return_value)
-        handshake.assert_called_once_with("tv.local", 3001, True)
-
-    def test_embedded_base64(self):
-        for encoded in ("AP9hc3NldA==", b"AP9hc3NldA=="):
-            with self.subTest(encoded=encoded):
-                with patch.object(slopbro, "EMBEDDED_WWWROOT", {
-                    "index.html": {"data": encoded},
-                }):
-                    self.assertEqual(
-                        slopbro._read_embedded_file("index.html"), b"\x00\xffasset",
-                    )
-
-    def test_key_persistence(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "keys", "tv.key")
-            with patch.object(slopbro, "key_path", return_value=path):
-                self.assertEqual(slopbro.load_client_key("tv"), "")
-                for key in ("first-key", "replacement-key"):
-                    slopbro.save_client_key("tv", key)
-                    self.assertEqual(slopbro.load_client_key("tv"), key)
-                with patch("builtins.open", side_effect=OSError("denied")):
-                    with patch.object(slopbro, "log") as logger:
-                        slopbro.save_client_key("tv", "unsaved-key")
-                    logger.assert_called_once()
-                    self.assertIn("could not save client key", logger.call_args[0][0])
+    def test_launch_payload_failure_is_rejected(self):
+        for response in ({'type': 'error'}, {'type': 'response', 'payload': {'returnValue': False}},
+                         {'type': 'response', 'payload': {}}):
+            with self.subTest(response=response), self.assertRaises(slopbro.SSAPError):
+                slopbro.launch_app(Mock(request=Mock(return_value=response)), 'app', {})
 
 
-if __name__ == "__main__":
+class CLITests(unittest.TestCase):
+    def test_unsafe_or_incomplete_cli_is_rejected_without_side_effects(self):
+        invalid = [[], ['tv'], ['--curl-insecure', 'tv'], ['--telnet', 'tv'],
+                   ['--tv-cert-sha256', 'bad'], ['--fake-service-path', '/a/../b'],
+                   ['--fake-service-path', '/a;id'], ['--payload-host', 'https://example'],
+                   ['--operation-timeout', 'nan'], ['--operation-timeout', '0']]
+        with patch.object(slopbro, 'run') as run, patch.object(slopbro, 'run_test_payload') as payload:
+            for args in invalid:
+                with self.subTest(args=args), patch('sys.stderr', new=io.StringIO()), self.assertRaises(SystemExit) as caught:
+                    slopbro.main(args)
+                self.assertEqual(caught.exception.code, 2)
+            run.assert_not_called()
+            payload.assert_not_called()
+
+    def test_simple_diagnostic_needs_no_credentials(self):
+        with patch.object(slopbro, 'run_test_connection') as run:
+            self.assertEqual(slopbro.main(['--test-server', 'simple']), 0)
+            run.assert_called_once()
+
+    def test_failure_returns_nonzero(self):
+        args = ['tv', '--tls-cert', 'cert', '--tls-key', 'key', '--payload-host', 'example.test',
+                '--tv-cert-sha256', 'a' * 64, '--webos-version', '9']
+        with patch.object(slopbro, 'run', side_effect=RuntimeError('installer failed')), patch('sys.stderr', new=io.StringIO()):
+            self.assertEqual(slopbro.main(args), 1)
+
+
+if __name__ == '__main__':
     unittest.main()
